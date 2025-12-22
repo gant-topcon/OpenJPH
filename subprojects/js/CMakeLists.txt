@@ -4,6 +4,8 @@ set(CMAKE_SYSTEM_NAME Generic)
 
 project (OpenJPH_WASM DESCRIPTION "Open source implementation of JPH" LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 add_subdirectory("../.." openjph EXCLUDE_FROM_ALL)
 add_executable(libopenjph "src/ojph_wrapper.cpp")
 if (OJPH_DISABLE_SIMD)
