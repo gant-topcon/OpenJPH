@@ -18,7 +18,7 @@ target_link_options(libopenjph PRIVATE
   -sMODULARIZE=1
   -sENVIRONMENT=web
   -sEXPORTED_FUNCTIONS=[_free,_malloc]
-  -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,writeArrayToMemory]
+  -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,writeArrayToMemory,HEAP32,HEAPU8]
   -sNO_EXIT_RUNTIME=1
   -sALLOW_MEMORY_GROWTH=1
   -sINITIAL_MEMORY=134217728
