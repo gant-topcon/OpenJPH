@@ -90,10 +90,9 @@ void cpp_parse_j2c_data(j2k_struct *j2c)
 //////////////////////////////////////////////////////////////////////////////
 void cpp_release_j2c_data(j2k_struct* j2c)
 {
-  if (j2c)
-  {
-    delete j2c;
-  }
+  delete j2c;
+  // we set to null here, so that multiple calls to release_j2c_data are safe
+  j2c = nullptr;
 }
 
 //////////////////////////////////////////////////////////////////////////////
