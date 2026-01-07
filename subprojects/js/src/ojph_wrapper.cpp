@@ -163,18 +163,18 @@ uint32_t cpp_calc_rgba_buffer_len(j2k_struct * const j2c) {
 // should be calculcated by using `calc_rgba_buffer_len`, which does some
 // sanity checks as well.
 //
-// @returns true if everything went fine, false otherwise. In case of false,
-// the elements inside the buffer should be considered invalid and must
+// @returns 0 if everything went fine, nonzero otherwise. In case of nonzero
+// return, the elements inside the buffer should be considered invalid and must
 // not be read.
-bool cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const buffer, uint32_t const buffer_len) {
+int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const buffer, uint32_t const buffer_len) {
   if (!j2c || !buffer) {
     printf("null-pointer given for j2c or buffer\n");
-    return false;
+    return -1;
   }
 
   if (buffer_len == 0) {
     printf("zero buffer length indicates error in buffer length calculation!\n");
-    return false;
+    return -1;
   }
 
   // number of components per line
@@ -198,8 +198,8 @@ bool cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * cons
   if (buffer_len != 4*line_width_px) {
     // we make sure that the buffer has exactly the number of elements needed
     // to prevent coding errors.
-    std::printf("invalid buffer len: expected exactly %d, got %d\n",line_width_px,buffer_len);
-    return false;
+    std::printf("invalid buffer len: expected exactly %d, got %d\n",4*line_width_px,buffer_len);
+    return -1;
   }
 
   if (num_comps == 1) {
@@ -245,9 +245,9 @@ bool cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * cons
     }
   } else {
     printf("Unsupported number of components (%d)\n",num_comps);
-    return false;
+    return -1;
   }
-  return true;
+  return 0;
 }
   
 
@@ -383,7 +383,7 @@ extern "C"
 
   ////////////////////////////////////////////////////////////////////////////
   EMSCRIPTEN_KEEPALIVE
-  bool decode_next_line_into_rgba_buffer(j2k_struct* const j2c,
+  int decode_next_line_into_rgba_buffer(j2k_struct* const j2c,
                                          uint8_t * const buffer,
                                          uint32_t const buffer_len)
   {

@@ -22,7 +22,9 @@ const wasmFunctions = {
   restrict_input_resolution: wasmModule.cwrap('restrict_input_resolution', 'void', ['number', 'number', 'number']),
   enable_resilience: wasmModule.cwrap('enable_resilience', 'void', ['number']),
   pull_j2c_line: wasmModule.cwrap('pull_j2c_line', 'number', ['number']),
-  release_j2c_data: wasmModule.cwrap('release_j2c_data', 'void', ['number'])
+  release_j2c_data: wasmModule.cwrap('release_j2c_data', 'void', ['number']),
+  calc_rgba_buffer_len: wasmModule.cwrap('calc_rgba_buffer_len', 'number', ['number']),
+  decode_next_line_into_rgba_buffer: wasmModule.cwrap('decode_next_line_into_rgba_buffer', 'number', ['number', 'number', 'number'])
 };
 
 /**
@@ -51,24 +53,44 @@ export function decodeHTJ2K(encodedData, options = {}) {
   // Allocate input buffer in WASM
   const buffer = Module._malloc(dataArray.length);
   let j2c = null;
-  
+  let rgbaBuffer = null;
+
+  if (buffer === 0) {
+    throw new Error(`error allocating WASM memory`);
+  }
+
   try {
     // Copy data to WASM memory
     Module.HEAPU8.set(dataArray, buffer);
     
     // Create and initialize decoder
     j2c = wasmFunctions.create_j2c_data();
+
+    if (j2c === 0) {
+      throw new Error(`error creating j2c data in WASM module`);
+    }
+      
     if (enableResilience) {
       wasmFunctions.enable_resilience(j2c);
     }
+
     wasmFunctions.init_j2c_data(j2c, buffer, dataArray.length);
     wasmFunctions.restrict_input_resolution(j2c, skipResForData, skipResForRecon);
     
+    const rgbaBufferLen = wasmFunctions.calc_rgba_buffer_len(j2c) | 0;
+    if (rgbaBufferLen === 0) {
+      throw new Error(`error calculating rgba buffer length (indicates inconsistencies in image dims or depth)`);
+    }
+
+    rgbaBuffer = Module._malloc(rgbaBufferLen);
+    if (rgbaBuffer === 0) {
+      throw new Error(`error allocating RGBA buffer in WASM module`);
+    }
+
+
     // Get image metadata
     const width = wasmFunctions.get_j2c_width(j2c, 0) | 0;
     const height = wasmFunctions.get_j2c_height(j2c, 0) | 0;
-    const numComps = wasmFunctions.get_j2c_num_components(j2c) | 0;
-    const bitDepth = wasmFunctions.get_j2c_bit_depth(j2c, 0) | 0;
     
     // Parse codestream
     wasmFunctions.parse_j2c_data(j2c);
@@ -77,57 +99,28 @@ export function decodeHTJ2K(encodedData, options = {}) {
     const imageData = new ImageData(width, height);
     const dst = imageData.data;
     
-    // Calculate bit depth conversion parameters
-    const shift = (bitDepth >= 8 ? bitDepth - 8 : 0) | 0;
-    const half = (bitDepth > 8 ? (1 << (shift - 1)) : 0) | 0;
-    const heap = Module.HEAP32;
-    
-    // Decode based on number of components
-    if (numComps === 1) {
-      // Grayscale
-      for (let y = 0; y < height; y = y + 1 | 0) {
-        const src = wasmFunctions.pull_j2c_line(j2c) >> 2;
-        const didx = y * width * 4;
-        
-        for (let x = 0; x < width; x = x + 1 | 0) {
-          const val = (heap[src + x] + half) >> shift;
-          dst[didx + x * 4] = val;
-          dst[didx + x * 4 + 1] = val;
-          dst[didx + x * 4 + 2] = val;
-          dst[didx + x * 4 + 3] = 255;
-        }
+    const heap8 = Module.HEAPU8;
+
+    for (let y = 0; y < height; y++) {
+      const offset = y*width*4;
+      if (wasmFunctions.decode_next_line_into_rgba_buffer(j2c, rgbaBuffer, rgbaBufferLen) !==0) {
+        throw new Error(`error decoding line ${y}`);
       }
-    } else if (numComps === 3) {
-      // RGB
-      for (let y = 0; y < height; y = y + 1 | 0) {
-        for (let c = 0; c < numComps; c = c + 1 | 0) {
-          const src = wasmFunctions.pull_j2c_line(j2c) >> 2;
-          const didx = y * width * 4 + c;
-          
-          for (let x = 0; x < width; x = x + 1 | 0) {
-            const val = (heap[src + x] + half) >> shift;
-            dst[didx + x * 4] = val;
-          }
-        }
-        
-        // Set alpha channel
-        const didx = y * width * 4 + 3;
-        for (let x = 0; x < width; x = x + 1 | 0) {
-          dst[didx + x * 4] = 255;
-        }
-      }
-    } else {
-      throw new Error(`Unsupported number of components: ${numComps}`);
+      dst.set(heap8.subarray(rgbaBuffer, rgbaBuffer+rgbaBufferLen),offset);
     }
-    
+   
     return imageData;
-    
   } finally {
     // Always cleanup, even if error occurred
     if (buffer) {
       Module._free(buffer);
     }
-    wasmFunctions.release_j2c_data(j2c);
+    if (rgbaBuffer) {
+      Module._free(rgbaBuffer);
+    }
+    if (j2c) {
+      wasmFunctions.release_j2c_data(j2c);
+    }
   }
 }
 
