@@ -35,10 +35,15 @@
 // Date: 22 October 2019
 /****************************************************************************/
 
+#include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <emscripten.h>
+#include <iterator>
+#include <sys/types.h>
 
 #include "ojph_arch.h"
+#include "ojph_defs.h"
 #include "ojph_file.h"
 #include "ojph_mem.h"
 #include "ojph_params.h"
@@ -91,8 +96,6 @@ void cpp_parse_j2c_data(j2k_struct *j2c)
 void cpp_release_j2c_data(j2k_struct* j2c)
 {
   delete j2c;
-  // we set to null here, so that multiple calls to release_j2c_data are safe
-  j2c = nullptr;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -120,6 +123,133 @@ void cpp_restrict_input_resolution(j2k_struct* j2c,
   j2c->codestream.restrict_input_resolution(skipped_res_for_read, 
                                             skipped_res_for_recon);
 }
+
+// returns the number of bytes needed for an rgba buffer for the j2c handle.
+// Also performs some sanity checks (like all components having the same bit depth
+// and dimensions), so very useful to call once before decoding the lines to an
+// rgba buffer.
+//
+// @returns 0 on error, a nonzero number of bytes needed for the RGBA buffer
+// to hold the elements otherwise.
+// 
+uint32_t cpp_calc_rgba_buffer_len(j2k_struct * const j2c) {
+  if (!j2c) {
+    printf("null-pointer given for j2c or buffer!\n");
+    return 0;
+  }
+  // number of components per line
+  const auto num_comps = j2c->codestream.access_siz().get_num_components();
+
+  // NOTE: those fields are filled by querying component 0, but downstream
+  // we make sure that this is the same for all components, which is what we
+  // expect.
+  
+  const auto line_width_px = j2c->codestream.access_siz().get_recon_width(0);
+  const auto bit_depth = j2c->codestream.access_siz().get_bit_depth(0);
+
+  for (uint32_t c = 1; c < num_comps; ++c) {
+    const auto cur_line_width_px = j2c->codestream.access_siz().get_recon_width(c);
+    const auto cur_bit_depth = j2c->codestream.access_siz().get_bit_depth(c);
+    if (cur_bit_depth != bit_depth || cur_line_width_px != line_width_px) {
+      printf("different bit depth or line width for different coordinates!\n");
+      return 0;
+    }
+  }
+  return 4*line_width_px;
+}
+
+// Decode the next line of the image into the given byte buffer to RGBA format.
+// The buffer must be able to hold at least `buffer_len` bytes. The `buffer_len`
+// should be calculcated by using `calc_rgba_buffer_len`, which does some
+// sanity checks as well.
+//
+// @returns true if everything went fine, false otherwise. In case of false,
+// the elements inside the buffer should be considered invalid and must
+// not be read.
+bool cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const buffer, uint32_t const buffer_len) {
+  if (!j2c || !buffer) {
+    printf("null-pointer given for j2c or buffer\n");
+    return false;
+  }
+
+  if (buffer_len == 0) {
+    printf("zero buffer length indicates error in buffer length calculation!\n");
+    return false;
+  }
+
+  // number of components per line
+  const auto num_comps = j2c->codestream.access_siz().get_num_components();
+
+  
+  // NOTE(gant): this is only the depth of component 0, but we assume they are the same
+  // for all components. The user should have requested the line buffer size
+  // with the `get_rgba_buffer_len` function, which does check that this is the
+  // case. So by checking only component 0 here we strike a balance between
+  // safety and efficiency.
+  const auto line_width_px = j2c->codestream.access_siz().get_recon_width(0);
+  const auto bit_depth = j2c->codestream.access_siz().get_bit_depth(0);
+
+  // NOTE(gant): these calculations are used to shift a value that is potentially
+  // in a bit-range > 8 into an 8 bit range. Taken from the original code in
+  // the index.html in the OpenJPH javascript/wasm subproject.
+  const auto shift = (bit_depth >= 8 ? bit_depth - 8 : 0);
+  const auto half = (bit_depth > 8 ? (1 << (shift - 1)) : 0);
+
+  if (buffer_len != 4*line_width_px) {
+    // we make sure that the buffer has exactly the number of elements needed
+    // to prevent coding errors.
+    std::printf("invalid buffer len: expected exactly %d, got %d\n",line_width_px,buffer_len);
+    return false;
+  }
+
+  if (num_comps == 1) {
+    // we can ignore the component number here, because there's only
+    // one component anyways.
+    ojph::ui32 comp_num{};
+    ojph::line_buf* const line = j2c->codestream.pull(comp_num);
+    (void)(comp_num);
+
+    int32_t const* const src = line->i32;
+
+    // NOTE: we can make an outer if for bit depth >8 so that the the
+    // calculation on val is only performed for depth > 8, otherwise
+    // the value is cast and taken directly.
+    for (uint32_t x = 0; x < line_width_px; ++x) {
+      // shift the val into 8bit range (if necessary) and 
+      const auto val = static_cast<uint8_t>((src[x] + half) >> shift);
+      buffer[4*x] = val;
+      buffer[4*x+1] = val;
+      buffer[4*x+2] = val;
+      buffer[4*x+3] = 255;
+    }
+  } else if (num_comps == 3) {
+    // the values are pulled for the components individually and components
+    // 0 = R, 1 = G, 2 = B, if I understand correctly.
+    for (uint32_t c = 0; c < num_comps; ++c) {
+      ojph::ui32 comp_num{};
+      ojph::line_buf* const line = j2c->codestream.pull(comp_num);
+      // NOTE(gant): for added safety we could compare that comp_num == c, but
+      // this might be excessive...
+      (void)(comp_num);
+      int32_t const* const src = line->i32;
+      // NOTE(gant): same note as above for the 8bit images.
+      for (uint32_t x = 0; x < line_width_px; ++x) {
+        const auto val = static_cast<uint8_t>((src[x] + half) >> shift);
+        buffer[4*x + c] = val;
+      }
+    }
+
+    // now set the alpha channel to fully opaque
+    for (uint32_t x = 0; x < line_width_px; ++x) {
+      buffer[4*x + 3] = 255;
+    }
+  } else {
+    printf("Unsupported number of components (%d)\n",num_comps);
+    return false;
+  }
+  return true;
+}
+  
 
 //////////////////////////////////////////////////////////////////////////////
 extern "C"
