@@ -373,5 +373,21 @@ extern "C"
   {
     cpp_release_j2c_data(j2c);
   }
+
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  uint32_t calc_rgba_buffer_len(j2k_struct * const j2c)
+  {
+      return cpp_calc_rgba_buffer_len(j2c);
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  bool decode_next_line_into_rgba_buffer(j2k_struct* const j2c,
+                                         uint8_t * const buffer,
+                                         uint32_t const buffer_len)
+  {
+    return cpp_decode_next_line_into_rgba_buffer(j2c,buffer,buffer_len);
+  }
 }
 
