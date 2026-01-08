@@ -34,8 +34,6 @@
 // Author: Aous Naman
 // Date: 28 August 2019
 //***************************************************************************/
-
-
 #ifndef OJPH_ARCH_H
 #define OJPH_ARCH_H
 
@@ -44,7 +42,6 @@
 #include <cmath>
 
 #include "ojph_defs.h"
-
 
 ///////////////////////////////////////////////////////////////////////////////
 // preprocessor directives for compiler

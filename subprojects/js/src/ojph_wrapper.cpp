@@ -40,6 +40,7 @@
 #include <exception>
 #include <emscripten.h>
 #include <iterator>
+#include <new>
 #include <sys/types.h>
 
 #include "ojph_arch.h"
@@ -124,6 +125,47 @@ void cpp_restrict_input_resolution(j2k_struct* j2c,
                                             skipped_res_for_recon);
 }
 
+
+// Allocates an rgba buffer into which a line of the given image can be decoded.
+// 
+// Also performs some sanity checks (like all components having the same bit depth
+// and dimensions), so very useful to call once before decoding the lines to an
+// rgba buffer.
+//
+// @returns nullptr on error or a valid pointer to hold the elements otherwise.
+uint32_t* cpp_allocate_rgba_buffer(j2k_struct * const j2c) {
+  if (!j2c) {
+    printf("null-pointer given for j2c or buffer!\n");
+    return nullptr;
+  }
+  // number of components per line
+  const auto num_comps = j2c->codestream.access_siz().get_num_components();
+
+  // NOTE: those fields are filled by querying component 0, but downstream
+  // we make sure that this is the same for all components, which is what we
+  // expect.
+  
+  const auto line_width_px = j2c->codestream.access_siz().get_recon_width(0);
+  const auto bit_depth = j2c->codestream.access_siz().get_bit_depth(0);
+
+  for (uint32_t c = 1; c < num_comps; ++c) {
+    const auto cur_line_width_px = j2c->codestream.access_siz().get_recon_width(c);
+    const auto cur_bit_depth = j2c->codestream.access_siz().get_bit_depth(c);
+    if (cur_bit_depth != bit_depth || cur_line_width_px != line_width_px) {
+      printf("different bit depth or line width for different coordinates!\n");
+      return nullptr;
+    }
+  }
+
+  return new (std::nothrow) uint32_t[line_width_px];
+}
+
+// free the rgba buffer (that must have been allocated by the corresponding
+// function before).
+void cpp_free_rgba_buffer(uint32_t * const buffer) {
+  delete[] buffer;
+}
+
 // returns the number of bytes needed for an rgba buffer for the j2c handle.
 // Also performs some sanity checks (like all components having the same bit depth
 // and dimensions), so very useful to call once before decoding the lines to an
@@ -159,28 +201,22 @@ uint32_t cpp_calc_rgba_buffer_len(j2k_struct * const j2c) {
 }
 
 // Decode the next line of the image into the given byte buffer to RGBA format.
-// The buffer must be able to hold at least `buffer_len` bytes. The `buffer_len`
-// should be calculcated by using `calc_rgba_buffer_len`, which does some
-// sanity checks as well.
+//
+// The buffer must be non-null and must have been allocated with the `allocate rgba buffer`
+// function using the same struct pointer.
 //
 // @returns 0 if everything went fine, nonzero otherwise. In case of nonzero
 // return, the elements inside the buffer should be considered invalid and must
 // not be read.
-int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const buffer, uint32_t const buffer_len) {
+int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint32_t * const buffer) {
   if (!j2c || !buffer) {
     printf("null-pointer given for j2c or buffer\n");
-    return -1;
-  }
-
-  if (buffer_len == 0) {
-    printf("zero buffer length indicates error in buffer length calculation!\n");
     return -1;
   }
 
   // number of components per line
   const auto num_comps = j2c->codestream.access_siz().get_num_components();
 
-  
   // NOTE(gant): this is only the depth of component 0, but we assume they are the same
   // for all components. The user should have requested the line buffer size
   // with the `get_rgba_buffer_len` function, which does check that this is the
@@ -195,13 +231,6 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const
   const auto shift = (bit_depth >= 8 ? bit_depth - 8 : 0);
   const auto half = (bit_depth > 8 ? (1 << (shift - 1)) : 0);
 
-  if (buffer_len != 4*line_width_px) {
-    // we make sure that the buffer has exactly the number of elements needed
-    // to prevent coding errors.
-    std::printf("invalid buffer len: expected exactly %d, got %d\n",4*line_width_px,buffer_len);
-    return -1;
-  }
-
   if (num_comps == 1) {
     // we can ignore the component number here, because there's only
     // one component anyways.
@@ -211,20 +240,36 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const
 
     int32_t const* const src = line->i32;
 
-    // NOTE: we can make an outer if for bit depth >8 so that the the
-    // calculation on val is only performed for depth > 8, otherwise
-    // the value is cast and taken directly.
+    // Reinterpret buffer as uint32_t for 4-byte writes (RGBA as single 32-bit value)
+    // this is legal because 
+    uint32_t* const buffer32 = reinterpret_cast<uint32_t*>(buffer);
+    
+    // NOTE1 (gant): hopefully this loop auto-vectorizes when SIMD is available,
+    // but without using intrinsics directly, we can't be 100% sure. But this
+    // is measurably faster than the previous javascript implementation because
+    // we're not writing bytes individually
+    // NOTE2 (gant): I also tried an if branch with a dedicated for loop for
+    // 8bit image without the need for shifting, but this wasn't faster. In
+    // fact, it was slower.
+
     for (uint32_t x = 0; x < line_width_px; ++x) {
-      // shift the val into 8bit range (if necessary) and 
+      // the potentially shifted value clamped to 8 bits
       const auto val = static_cast<uint8_t>((src[x] + half) >> shift);
-      buffer[4*x] = val;
-      buffer[4*x+1] = val;
-      buffer[4*x+2] = val;
-      buffer[4*x+3] = 255;
+      // we write the RGBA value into a single 32-bit int RGBA and write it at once.
+      const uint32_t pixel = val | (val << 8) | (val << 16) | (0xFF << 24);
+      buffer32[x] = pixel;
     }
   } else if (num_comps == 3) {
     // the values are pulled for the components individually and components
     // 0 = R, 1 = G, 2 = B, if I understand correctly.
+
+    auto const set_byte = [](uint32_t bytes4, uint8_t value, uint32_t byte_idx){
+      // this is some bit-twiddling to set only one byte inside a 4-byte
+      // integer to a certain value.
+      uint32_t mask = ~(0xFFu << (8 * byte_idx));
+      return (bytes4 & mask) | ((uint32_t)value << (8 * byte_idx));
+    };
+
     for (uint32_t c = 0; c < num_comps; ++c) {
       ojph::ui32 comp_num{};
       ojph::line_buf* const line = j2c->codestream.pull(comp_num);
@@ -232,16 +277,15 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint8_t * const
       // this might be excessive...
       (void)(comp_num);
       int32_t const* const src = line->i32;
-      // NOTE(gant): same note as above for the 8bit images.
       for (uint32_t x = 0; x < line_width_px; ++x) {
         const auto val = static_cast<uint8_t>((src[x] + half) >> shift);
-        buffer[4*x + c] = val;
+        buffer[x] = set_byte(buffer[x], val, c);
       }
     }
 
     // now set the alpha channel to fully opaque
     for (uint32_t x = 0; x < line_width_px; ++x) {
-      buffer[4*x + 3] = 255;
+      buffer[x] = set_byte(buffer[x], 255, 3);
     }
   } else {
     printf("Unsupported number of components (%d)\n",num_comps);
@@ -384,10 +428,22 @@ extern "C"
   ////////////////////////////////////////////////////////////////////////////
   EMSCRIPTEN_KEEPALIVE
   int decode_next_line_into_rgba_buffer(j2k_struct* const j2c,
-                                         uint8_t * const buffer,
-                                         uint32_t const buffer_len)
+                                         uint32_t * const buffer)
   {
-    return cpp_decode_next_line_into_rgba_buffer(j2c,buffer,buffer_len);
+    return cpp_decode_next_line_into_rgba_buffer(j2c,buffer);
+  }
+
+  
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  uint32_t* allocate_rgba_buffer(j2k_struct * const j2c) {
+    return cpp_allocate_rgba_buffer(j2c);
+  }
+  
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  void free_rgba_buffer(uint32_t * const buffer) {
+    return cpp_free_rgba_buffer(buffer);
   }
 }
 

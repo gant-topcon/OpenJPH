@@ -24,7 +24,9 @@ const wasmFunctions = {
   pull_j2c_line: wasmModule.cwrap('pull_j2c_line', 'number', ['number']),
   release_j2c_data: wasmModule.cwrap('release_j2c_data', 'void', ['number']),
   calc_rgba_buffer_len: wasmModule.cwrap('calc_rgba_buffer_len', 'number', ['number']),
-  decode_next_line_into_rgba_buffer: wasmModule.cwrap('decode_next_line_into_rgba_buffer', 'number', ['number', 'number', 'number'])
+  decode_next_line_into_rgba_buffer: wasmModule.cwrap('decode_next_line_into_rgba_buffer', 'number', ['number', 'number']),
+  allocate_rgba_buffer: wasmModule.cwrap('allocate_rgba_buffer', 'number', ['number']),
+  free_rgba_buffer: wasmModule.cwrap('free_rgba_buffer', 'void', ['number'])
 };
 
 /**
@@ -82,7 +84,7 @@ export function decodeHTJ2K(encodedData, options = {}) {
       throw new Error(`error calculating rgba buffer length (indicates inconsistencies in image dims or depth)`);
     }
 
-    rgbaBuffer = Module._malloc(rgbaBufferLen);
+    rgbaBuffer = wasmFunctions.allocate_rgba_buffer(j2c);
     if (rgbaBuffer === 0) {
       throw new Error(`error allocating RGBA buffer in WASM module`);
     }
@@ -103,7 +105,7 @@ export function decodeHTJ2K(encodedData, options = {}) {
 
     for (let y = 0; y < height; y++) {
       const offset = y*width*4;
-      if (wasmFunctions.decode_next_line_into_rgba_buffer(j2c, rgbaBuffer, rgbaBufferLen) !==0) {
+      if (wasmFunctions.decode_next_line_into_rgba_buffer(j2c, rgbaBuffer) !==0) {
         throw new Error(`error decoding line ${y}`);
       }
       dst.set(heap8.subarray(rgbaBuffer, rgbaBuffer+rgbaBufferLen),offset);
@@ -116,7 +118,7 @@ export function decodeHTJ2K(encodedData, options = {}) {
       Module._free(buffer);
     }
     if (rgbaBuffer) {
-      Module._free(rgbaBuffer);
+      wasmFunctions.free_rgba_buffer(rgbaBuffer);
     }
     if (j2c) {
       wasmFunctions.release_j2c_data(j2c);
