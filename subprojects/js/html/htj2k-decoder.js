@@ -25,8 +25,11 @@ const wasmFunctions = {
   release_j2c_data: wasmModule.cwrap('release_j2c_data', 'void', ['number']),
   calc_rgba_buffer_len: wasmModule.cwrap('calc_rgba_buffer_len', 'number', ['number']),
   decode_next_line_into_rgba_buffer: wasmModule.cwrap('decode_next_line_into_rgba_buffer', 'number', ['number', 'number']),
-  allocate_rgba_buffer: wasmModule.cwrap('allocate_rgba_buffer', 'number', ['number']),
-  free_rgba_buffer: wasmModule.cwrap('free_rgba_buffer', 'void', ['number'])
+  allocate_rgba_line_buffer: wasmModule.cwrap('allocate_rgba_line_buffer', 'number', ['number']),
+  free_rgba_buffer: wasmModule.cwrap('free_rgba_buffer', 'void', ['number']),
+  allocate_rgba_image_buffer: wasmModule.cwrap('allocate_rgba_image_buffer', 'number', ['number']),
+  free_rgba_image_buffer: wasmModule.cwrap('free_rgba_image_buffer', 'void', ['number']),
+  decode_full_image_to_rgba_image_buffer: wasmModule.cwrap('decode_full_image_to_rgba_image_buffer', 'number', ['number','number'])
 };
 
 /**
@@ -44,7 +47,8 @@ export function decodeHTJ2K(encodedData, options = {}) {
   const {
     skipResForData = 0,
     skipResForRecon = 0,
-    enableResilience = true
+    enableResilience = true,
+    bulk = false
   } = options;
   
   // Convert to Uint8Array if needed
@@ -56,6 +60,7 @@ export function decodeHTJ2K(encodedData, options = {}) {
   const buffer = Module._malloc(dataArray.length);
   let j2c = null;
   let rgbaBuffer = null;
+  let imageBuffer = null;
 
   if (buffer === 0) {
     throw new Error(`error allocating WASM memory`);
@@ -79,17 +84,6 @@ export function decodeHTJ2K(encodedData, options = {}) {
     wasmFunctions.init_j2c_data(j2c, buffer, dataArray.length);
     wasmFunctions.restrict_input_resolution(j2c, skipResForData, skipResForRecon);
     
-    const rgbaBufferLen = wasmFunctions.calc_rgba_buffer_len(j2c) | 0;
-    if (rgbaBufferLen === 0) {
-      throw new Error(`error calculating rgba buffer length (indicates inconsistencies in image dims or depth)`);
-    }
-
-    rgbaBuffer = wasmFunctions.allocate_rgba_buffer(j2c);
-    if (rgbaBuffer === 0) {
-      throw new Error(`error allocating RGBA buffer in WASM module`);
-    }
-
-
     // Get image metadata
     const width = wasmFunctions.get_j2c_width(j2c, 0) | 0;
     const height = wasmFunctions.get_j2c_height(j2c, 0) | 0;
@@ -103,12 +97,38 @@ export function decodeHTJ2K(encodedData, options = {}) {
     
     const heap8 = Module.HEAPU8;
 
-    for (let y = 0; y < height; y++) {
-      const offset = y*width*4;
-      if (wasmFunctions.decode_next_line_into_rgba_buffer(j2c, rgbaBuffer) !==0) {
-        throw new Error(`error decoding line ${y}`);
+    if (!bulk) {
+      // this is line by line decoding, which is already very efficient.
+      // The only overhead is the constant copying of memory and the calling
+      // into the wasm functions.
+      const rgbaBufferLen = wasmFunctions.calc_rgba_buffer_len(j2c) | 0;
+      if (rgbaBufferLen === 0) {
+        throw new Error(`error calculating rgba buffer length (indicates inconsistencies in image dims or depth)`);
       }
-      dst.set(heap8.subarray(rgbaBuffer, rgbaBuffer+rgbaBufferLen),offset);
+      
+      rgbaBuffer = wasmFunctions.allocate_rgba_line_buffer(j2c);
+      if (rgbaBuffer === 0) {
+        throw new Error(`error allocating RGBA line buffer in WASM module`);
+      }
+      
+      for (let y = 0; y < height; y++) {
+        const offset = y*width*4;
+        if (wasmFunctions.decode_next_line_into_rgba_buffer(j2c, rgbaBuffer) !==0) {
+          throw new Error(`error decoding line ${y}`);
+        }
+        dst.set(heap8.subarray(rgbaBuffer, rgbaBuffer+rgbaBufferLen),offset);
+      }
+    } else {
+      // bulk decoding eliminates the call for JS/WASM interaction per
+      // line.
+      imageBuffer = wasmFunctions.allocate_rgba_image_buffer(j2c);
+      if (imageBuffer === 0) {
+        throw new Error(`error allocating RGBA image buffer in WASM module`);
+      }
+      if (wasmFunctions.decode_full_image_to_rgba_image_buffer(j2c,imageBuffer) !==0) {
+          throw new Error(`error decoding image`);
+      }
+      dst.set(heap8.subarray(imageBuffer, imageBuffer+4*width*height));
     }
    
     return imageData;
@@ -122,6 +142,9 @@ export function decodeHTJ2K(encodedData, options = {}) {
     }
     if (j2c) {
       wasmFunctions.release_j2c_data(j2c);
+    }
+    if (imageBuffer) {
+      wasmFunctions.free_rgba_image_buffer(imageBuffer);
     }
   }
 }

@@ -35,6 +35,7 @@
 // Date: 22 October 2019
 /****************************************************************************/
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -49,6 +50,8 @@
 #include "ojph_mem.h"
 #include "ojph_params.h"
 #include "ojph_codestream.h"
+
+#include "wasm_simd128.h"
 
 //////////////////////////////////////////////////////////////////////////////
 struct j2k_struct
@@ -133,7 +136,7 @@ void cpp_restrict_input_resolution(j2k_struct* j2c,
 // rgba buffer.
 //
 // @returns nullptr on error or a valid pointer to hold the elements otherwise.
-uint32_t* cpp_allocate_rgba_buffer(j2k_struct * const j2c) {
+uint32_t* cpp_allocate_rgba_line_buffer(j2k_struct * const j2c) {
   if (!j2c) {
     printf("null-pointer given for j2c or buffer!\n");
     return nullptr;
@@ -221,6 +224,51 @@ void write_grayscale_to_rgba(int32_t const* const __restrict src_grayscale,
     }
 }
 
+#ifdef __wasm_simd128__
+void write_grayscale_to_rgba_simd128(int32_t const* const __restrict src_grayscale,
+                             uint32_t * const __restrict rgba_out,
+                             uint32_t pixel_count,
+                             int32_t const half,
+                             uint32_t const shift) {
+    
+    auto const half_v = wasm_i32x4_splat(half);
+    auto const max_v = wasm_i32x4_splat(255);
+    auto const alpha_v = wasm_i32x4_splat(0xFF000000);
+
+    uint32_t x = 0;
+    
+    for (; x < pixel_count; x+=4) {
+
+      auto v = wasm_v128_load(src_grayscale + x);
+      v = wasm_i32x4_add(v, half_v);
+      v = wasm_u32x4_shr(v,shift);
+      v = wasm_u32x4_min(v, max_v);
+
+      auto const s8 = wasm_i32x4_shl(v, 8);
+      auto const s16 = wasm_i32x4_shl(v, 16);
+      auto p = wasm_v128_or(v, s8);
+      p = wasm_v128_or(p, s16);
+      p = wasm_v128_or(p, alpha_v);
+      
+      wasm_v128_store(rgba_out + x, p);
+      // // the potentially shifted value clamped to 8 bits
+      // const auto val = static_cast<uint8_t>((src_grayscale[x] + half) >> shift);
+      // // we write the RGBA value into a single 32-bit int RGBA and write it at once.
+      // const uint32_t pixel = val | (val << 8) | (val << 16) | (0xFF << 24);
+      // rgba_out[x] = pixel;
+    }
+
+    // process tail without simd instructions
+    for (; x < pixel_count; ++x) {
+      // the potentially shifted value clamped to 8 bits
+      const auto val = static_cast<uint8_t>((src_grayscale[x] + half) >> shift);
+      // we write the RGBA value into a single 32-bit int RGBA and write it at once.
+      const uint32_t pixel = val | (val << 8) | (val << 16) | (0xFF << 24);
+      rgba_out[x] = pixel;
+    }
+}
+#endif
+
 // Decode the next line of the image into the given byte buffer to RGBA format.
 //
 // The buffer must be non-null and must have been allocated with the `allocate rgba buffer`
@@ -261,10 +309,17 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint32_t * cons
 
     int32_t const* const src = line->i32;
     
-    write_grayscale_to_rgba(src, buffer, line_width_px, half, shift);
+    #ifdef __wasm_simd128__
+      write_grayscale_to_rgba_simd128(src, buffer, line_width_px, half, shift);
+    #else 
+      write_grayscale_to_rgba(src, buffer, line_width_px, half, shift);
+    #endif
   } else if (num_comps == 3) {
     // the values are pulled for the components individually and components
-    // 0 = R, 1 = G, 2 = B, if I understand correctly.
+    // 0 = R, 1 = G, 2 = B, if I understand correctly, which makes the logic
+    // a little more annoying, because we first have to set all R values,
+    // then all G values, B values, and alpha at the end. It should still
+    // be vectorizable, but possibly less efficiently than the code above.
 
     auto const set_byte = [](uint32_t bytes4, uint8_t value, uint32_t byte_idx){
       // this is some bit-twiddling to set only one byte inside a 4-byte
@@ -296,7 +351,89 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint32_t * cons
   }
   return 0;
 }
+
+
+
+// a magic constant that helps us check that a rgba buffer is likely to be
+// a correct new image buffer.
+constexpr uint32_t MAGIC_NUMBER = 0xD00DAB1D; // "the dude abides"
+
+uint32_t * cpp_allocate_rgba_image_buffer(j2k_struct * const j2c) {
+  if (!j2c) {
+    printf("null-pointer given for j2c or buffer!\n");
+    return nullptr;
+  }
+  // number of components per line
+  const auto num_comps = j2c->codestream.access_siz().get_num_components();
+
+  // NOTE: those fields are filled by querying component 0, but downstream
+  // we make sure that this is the same for all components, which is what we
+  // expect.
   
+  const auto recon_width = j2c->codestream.access_siz().get_recon_width(0);
+  const auto recon_height = j2c->codestream.access_siz().get_recon_height(0);
+  const auto bit_depth = j2c->codestream.access_siz().get_bit_depth(0);
+
+  for (uint32_t c = 1; c < num_comps; ++c) {
+    const auto cur_recon_width = j2c->codestream.access_siz().get_recon_width(c);
+    const auto cur_recon_height = j2c->codestream.access_siz().get_recon_height(c);
+    const auto cur_bit_depth = j2c->codestream.access_siz().get_bit_depth(c);
+    if (cur_bit_depth != bit_depth ||
+        cur_recon_width != recon_width ||
+        cur_recon_height != recon_height) {
+      printf("different bit depth or line width for different coordinates!\n");
+      return nullptr;
+    }
+  }
+
+  auto const pixelcount = static_cast<std::size_t>(recon_width)*static_cast<std::size_t>(recon_height);
+
+  if (pixelcount == 0) {
+    return nullptr;
+  }
+
+  auto buffer = new (std::nothrow) uint32_t[pixelcount];
+
+  // we set the first value (we know this exists)
+  // to the magic number.
+  if (buffer) {
+    buffer[0] = MAGIC_NUMBER;
+  }
+
+  return buffer;
+}
+
+void cpp_free_rgba_image_buffer(uint32_t * const buffer) {
+  delete[] buffer;
+}
+
+bool cpp_decode_full_image_to_rgba_image_buffer(j2k_struct * const j2c,
+                                                uint32_t* const image_buffer) {
+
+  if (!image_buffer) {
+    printf("nullpointer given for image buffer.\n");
+    return false;
+  }
+
+  if (image_buffer[0] != MAGIC_NUMBER) {
+    printf("image buffer doesn't have magic bytes at the beginning.\n");
+    return false;
+  }
+
+  // we already know all the 
+  const auto width = j2c->codestream.access_siz().get_recon_width(0);
+  const auto height = j2c->codestream.access_siz().get_recon_height(0);
+
+  for (uint32_t y = 0; y < height; ++y) {
+    if(cpp_decode_next_line_into_rgba_buffer(j2c, image_buffer+y*width)!=0) {
+      return false;
+    }
+  }
+  
+  return true;
+}
+  
+
 
 //////////////////////////////////////////////////////////////////////////////
 extern "C"
@@ -439,14 +576,33 @@ extern "C"
   
   ////////////////////////////////////////////////////////////////////////////
   EMSCRIPTEN_KEEPALIVE
-  uint32_t* allocate_rgba_buffer(j2k_struct * const j2c) {
-    return cpp_allocate_rgba_buffer(j2c);
+  uint32_t* allocate_rgba_line_buffer(j2k_struct * const j2c) {
+    return cpp_allocate_rgba_line_buffer(j2c);
   }
   
   ////////////////////////////////////////////////////////////////////////////
   EMSCRIPTEN_KEEPALIVE
   void free_rgba_buffer(uint32_t * const buffer) {
     return cpp_free_rgba_buffer(buffer);
+  }
+  
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  uint32_t * allocate_rgba_image_buffer(j2k_struct * const j2c) {
+    return cpp_allocate_rgba_image_buffer(j2c);
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  void free_rgba_image_buffer(uint32_t * const buffer) {
+    return cpp_free_rgba_image_buffer(buffer);
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+  EMSCRIPTEN_KEEPALIVE
+  int decode_full_image_to_rgba_image_buffer(j2k_struct * const j2c,
+                                                uint32_t* const image_buffer) {
+    return cpp_decode_full_image_to_rgba_image_buffer(j2c,image_buffer) ? 0 : -1;
   }
 }
 
