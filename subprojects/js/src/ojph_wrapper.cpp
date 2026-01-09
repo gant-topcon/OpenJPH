@@ -200,6 +200,27 @@ uint32_t cpp_calc_rgba_buffer_len(j2k_struct * const j2c) {
   return 4*line_width_px;
 }
 
+void write_grayscale_to_rgba(int32_t const* const __restrict src_grayscale,
+                             uint32_t * const __restrict rgba_out,
+                             uint32_t pixel_count,
+                             int32_t const half,
+                             uint32_t const shift) {
+    // NOTE1 (gant): hopefully this loop auto-vectorizes when SIMD is available,
+    // but without using intrinsics directly, we can't be 100% sure. But this
+    // is measurably faster than the previous javascript implementation because
+    // we're not writing bytes individually
+    // NOTE2 (gant): I also tried an if branch with a dedicated for loop for
+    // 8bit image without the need for shifting, but this wasn't faster. In
+    // fact, it was slower.
+    for (uint32_t x = 0; x < pixel_count; ++x) {
+      // the potentially shifted value clamped to 8 bits
+      const auto val = static_cast<uint8_t>((src_grayscale[x] + half) >> shift);
+      // we write the RGBA value into a single 32-bit int RGBA and write it at once.
+      const uint32_t pixel = val | (val << 8) | (val << 16) | (0xFF << 24);
+      rgba_out[x] = pixel;
+    }
+}
+
 // Decode the next line of the image into the given byte buffer to RGBA format.
 //
 // The buffer must be non-null and must have been allocated with the `allocate rgba buffer`
@@ -239,26 +260,8 @@ int cpp_decode_next_line_into_rgba_buffer(j2k_struct* const j2c, uint32_t * cons
     (void)(comp_num);
 
     int32_t const* const src = line->i32;
-
-    // Reinterpret buffer as uint32_t for 4-byte writes (RGBA as single 32-bit value)
-    // this is legal because 
-    uint32_t* const buffer32 = reinterpret_cast<uint32_t*>(buffer);
     
-    // NOTE1 (gant): hopefully this loop auto-vectorizes when SIMD is available,
-    // but without using intrinsics directly, we can't be 100% sure. But this
-    // is measurably faster than the previous javascript implementation because
-    // we're not writing bytes individually
-    // NOTE2 (gant): I also tried an if branch with a dedicated for loop for
-    // 8bit image without the need for shifting, but this wasn't faster. In
-    // fact, it was slower.
-
-    for (uint32_t x = 0; x < line_width_px; ++x) {
-      // the potentially shifted value clamped to 8 bits
-      const auto val = static_cast<uint8_t>((src[x] + half) >> shift);
-      // we write the RGBA value into a single 32-bit int RGBA and write it at once.
-      const uint32_t pixel = val | (val << 8) | (val << 16) | (0xFF << 24);
-      buffer32[x] = pixel;
-    }
+    write_grayscale_to_rgba(src, buffer, line_width_px, half, shift);
   } else if (num_comps == 3) {
     // the values are pulled for the components individually and components
     // 0 = R, 1 = G, 2 = B, if I understand correctly.
