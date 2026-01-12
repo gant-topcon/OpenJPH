@@ -225,6 +225,10 @@ void write_grayscale_to_rgba(int32_t const* const __restrict src_grayscale,
 }
 
 #ifdef __wasm_simd128__
+// this function doesn't yet offer any performance advantages comparted to the
+// non-expcicitly vectorized function. There's probably a way to use 4 32-bit
+// loads and lower them to 16 u8 pixels, but I'm not sure how to do that and
+// also whether this is really worth doing even if there are performance benefits.
 void write_grayscale_to_rgba_simd128(int32_t const* const __restrict src_grayscale,
                              uint32_t * const __restrict rgba_out,
                              uint32_t pixel_count,
